@@ -1,12 +1,15 @@
 import base64
 import dataclasses
+import json
 import multiprocessing
 import re
+import subprocess
 import time
 import os
 import sys
 import math
 from pathlib import Path
+from subprocess import CalledProcessError
 from typing import Any, Optional
 
 import torch.cuda
@@ -155,8 +158,9 @@ def _run_single_test(test: TestCase):
     """
     from submission import custom_kernel
     data = generate_input(**test.args)
+    cloned_input = _clone_data(data)
     torch.cuda.synchronize()
-    submission_output = custom_kernel(_clone_data(data))
+    submission_output = custom_kernel(cloned_input)
     torch.cuda.synchronize()
     return wrap_check_implementation(data, submission_output)
 
@@ -166,6 +170,88 @@ def run_single_test(pool: multiprocessing.Pool, test: TestCase):
     Runs a single test in another process.
     """
     return pool.apply(_run_single_test, (test,))
+
+
+def run_test_in_sanitizer_process(test: TestCase):
+    #import nvtx
+    from submission import custom_kernel
+    data = generate_input(**test.args)
+    cloned_input = _clone_data(data)
+    torch.cuda.synchronize()
+    #with nvtx.annotate("custom_kernel"):
+    submission_output = custom_kernel(cloned_input)
+    torch.cuda.synchronize()
+    return wrap_check_implementation(data, submission_output)
+
+
+def run_test_with_sanitizer_main(test_in_path: str, test_out_path: str):
+    test = TestCase(**json.loads(Path(test_in_path).read_text()))
+    result = run_test_in_sanitizer_process(test)
+    Path(test_out_path).write_text(json.dumps(result))
+
+
+def run_test_with_sanitizer(test: TestCase, tool: str):
+    import tempfile
+
+    with tempfile.NamedTemporaryFile("w") as test_in, tempfile.NamedTemporaryFile("r") as test_out:
+        Path(test_in.name).write_text(json.dumps(dataclasses.asdict(test)))
+        test_in.flush()
+
+        try:
+            _ = subprocess.check_output([
+                "compute-sanitizer", f"--tool={tool}",
+                #"--nvtx-include", "custom_kernel",  no nvtx filtering possible :(
+                "--error-exitcode", "1",
+                "python3", "-c",
+                f"import sys; sys.path.append('.'); "
+                f"from eval import run_test_with_sanitizer_main; "
+                f"run_test_with_sanitizer_main('{test_in.name}', '{test_out.name}')"
+            ], encoding="utf-8")
+            good, message = json.loads(Path(test_out.name).read_text())
+            return True, good, message
+        except CalledProcessError as E:
+            return False, True, "Sanitizer failure"
+
+
+def run_sanitizer(logger: PopcornOutput, tests: list[TestCase], tool: str):
+    """
+    Executes the actual test case code and checks for correctness.
+
+    @param logger: A PopcornOutput object used for logging test results.
+    @param tests: A list of TestCase objects representing the test cases to be executed.
+    @param tool: Which sanitizer to run under. Leave empty for raw run.
+    @return: An integer representing the exit status: 0 if all tests pass, otherwise 112.
+    """
+    passed = True
+    sane = True
+    logger.log("test-count", len(tests))
+    for idx, test in enumerate(tests):
+        logger.log(f"test.{idx}.spec", test.spec)
+        sane, good, message = run_test_with_sanitizer(test, tool)
+        if not sane:
+            logger.log(f"test.{idx}.status", "fail")
+            logger.log(f"test.{idx}.error", message)
+            sane = False
+            passed = False
+        if not good:
+            logger.log(f"test.{idx}.status", "fail")
+            logger.log(f"test.{idx}.error", message)
+            passed = False
+        else:
+            logger.log(f"test.{idx}.status", "pass")
+            if message:
+                logger.log(f"test.{idx}.message", message)
+
+    if not sane:
+        logger.log("check", "fail")
+        return 115
+
+    if passed:
+        logger.log("check", "pass")
+        return 0
+    else:
+        logger.log("check", "fail")
+        return 112
 
 
 def run_testing(logger: PopcornOutput, pool: multiprocessing.Pool, tests: list[TestCase]):
@@ -181,6 +267,7 @@ def run_testing(logger: PopcornOutput, pool: multiprocessing.Pool, tests: list[T
     for idx, test in enumerate(tests):
         logger.log(f"test.{idx}.spec", test.spec)
         good, message = run_single_test(pool, test)
+
         if not good:
             logger.log(f"test.{idx}.status", "fail")
             logger.log(f"test.{idx}.error", message)
@@ -219,6 +306,7 @@ def _run_single_benchmark(test: TestCase, recheck: bool, max_repeats: int, max_t
     # otherwise, we repeat until we either measure at least 10 full seconds,
     # or the relative error of the mean is below 1%.
 
+    bm_start_time = time.perf_counter_ns()
     for i in range(max_repeats):
         if recheck:
             # ensure we use a different seed for every benchmark
@@ -239,17 +327,23 @@ def _run_single_benchmark(test: TestCase, recheck: bool, max_repeats: int, max_t
                 return message
 
         del output
-        durations.append(end-start)
+        durations.append(end - start)
 
         if i > 1:
+            total_bm_duration = time.perf_counter_ns() - bm_start_time
             stats = calculate_stats(durations)
-            if stats.err / stats.mean < 0.001 or stats.mean * stats.runs > max_time_ns:
+            # stop if either
+            # a) relative error dips below 0.1%
+            # b) we exceed the total time limit for benchmarking the kernel
+            # c) we exceed 2 minutes of total wallclock time.
+            if stats.err / stats.mean < 0.001 or stats.mean * stats.runs > max_time_ns or total_bm_duration > 120e9:
                 break
 
     return calculate_stats(durations)
 
 
-def run_single_benchmark(pool: multiprocessing.Pool, test: TestCase, recheck: bool, max_repeats: int, max_time_ns: float):
+def run_single_benchmark(pool: multiprocessing.Pool, test: TestCase, recheck: bool, max_repeats: int,
+                         max_time_ns: float):
     """
     For a particular test case, check correctness (if applicable) and grab runtime results.
 
@@ -301,12 +395,12 @@ def run_single_profile(test: TestCase) -> str:
     Runs a single test case. Do not call directly
     """
     from submission import custom_kernel
-    from torch.profiler import profile, record_function, ProfilerActivity
+    from torch.profiler import profile, ProfilerActivity
     data = generate_input(**test.args)
     torch.cuda.synchronize()
 
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
-        submission_output = custom_kernel(_clone_data(data))
+        _ = custom_kernel(_clone_data(data))
         torch.cuda.synchronize()
     return prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=20)
 
@@ -337,6 +431,16 @@ def main():
     tests = get_test_cases(sys.argv[2], seed)
 
     with PopcornOutput(int(fd)) as logger:
+        # sanitizers do custom spawn logic, so no multiprocessing
+        if mode == "memcheck":
+            return run_sanitizer(logger, tests, "memcheck")
+        elif mode == "synccheck":
+            return run_sanitizer(logger, tests, "synccheck")
+        elif mode == "initcheck":
+            return run_sanitizer(logger, tests, "initcheck")
+        elif mode == "racecheck":
+            return run_sanitizer(logger, tests, "racecheck")
+
         import multiprocessing
         mp_context = multiprocessing.get_context('spawn')
         with mp_context.Pool(1) as pool:
@@ -359,7 +463,7 @@ def main():
                     else:
                         passed = False
                         logger.log(f"benchmark.{i}.status", "fail")
-                        logger.log(f"benchmark.{i}.error", str(result)) #TODO: Make sure result implements __str__?
+                        logger.log(f"benchmark.{i}.error", str(result))  # TODO: Make sure result implements __str__?
                         break
 
                 logger.log("check", "pass" if passed else "fail")

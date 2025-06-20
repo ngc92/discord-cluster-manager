@@ -208,6 +208,25 @@ class LeaderboardSubmitCog(app_commands.Group):
             interaction, leaderboard_name, script, mode=SubmissionMode.TEST, gpu=gpu
         )
 
+    @app_commands.command(name="sanitizer", description="Start a sanitized run")
+    @app_commands.describe(
+        leaderboard_name="Name of the competition / kernel to optimize",
+        script="The Python / CUDA script file to run",
+        gpu="Select GPU. Leave empty for interactive or automatic selection.",
+    )
+    @app_commands.autocomplete(leaderboard_name=leaderboard_name_autocomplete)
+    @with_error_handling
+    async def submit_sanitizer(
+        self,
+        interaction: discord.Interaction,
+        script: discord.Attachment,
+        leaderboard_name: Optional[str] = None,
+        gpu: Optional[str] = None,
+    ):
+        return await self.submit(
+            interaction, leaderboard_name, script, mode=SubmissionMode.SANITIZER, gpu=gpu
+        )
+
     @app_commands.command(name="benchmark", description="Start a benchmarking run")
     @app_commands.describe(
         leaderboard_name="Name of the competition / kernel to optimize",

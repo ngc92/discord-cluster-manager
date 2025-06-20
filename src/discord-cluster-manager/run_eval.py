@@ -291,7 +291,7 @@ def run_single_evaluation(
     A single runner run, either in the context of test files, or in the
     context of benchmark files.
     """
-    if mode == "test":
+    if mode in ["test", "memcheck", "synccheck", "initcheck", "racecheck"]:
         with tempfile.NamedTemporaryFile("w") as tests_file:
             tests_file.write(tests)
             tests_file.flush()
@@ -513,12 +513,26 @@ def run_evaluation(
     results: dict[str, EvalResult] = {}
     if mode in ["test", "benchmark", "profile", "script"]:
         results[mode] = call(mode=mode)
+    elif mode in ["sanitizer"]:
+        results["memcheck"] = call(mode="memcheck")
+        if not results["memcheck"].run or not results["memcheck"].run.passed:
+            return results
+
+        results["synccheck"] = call(mode="synccheck")
+        results["racecheck"] = call(mode="racecheck")
+        results["initcheck"] = call(mode="initcheck")
+
     elif mode in ["private", "leaderboard"]:
         # first, run the tests
         results["test"] = call(mode="test")
 
         if not results["test"].run or not results["test"].run.passed:
             return results
+
+        results["memcheck"] = call(mode="memcheck")
+        results["synccheck"] = call(mode="synccheck")
+        results["racecheck"] = call(mode="racecheck")
+        results["initcheck"] = call(mode="initcheck")
 
         results["benchmark"] = call(mode="benchmark")
 

@@ -230,7 +230,10 @@ class KernelBackend:
         if mode != SubmissionMode.PRIVATE:
             try:
                 # does the last message of the short report start with ✅ or ❌?
-                verdict = short_report[-1][0]
+                if len(short_report) > 0:
+                    verdict = short_report[-1][0]
+                else:
+                    verdict = "?"
                 id_str = f"{verdict}" if submission_id == -1 else f"{verdict} #{submission_id}"
                 await reporter.display_report(
                     f"{id_str} {name} on {gpu_type.name} ({launcher.name})",

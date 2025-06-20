@@ -74,12 +74,15 @@ class ExitCode(IntEnum):
     TEST_SPEC = 113
     # process was shut down because it timed out
     TIMEOUT_EXPIRED = 114
+    # sanitizer detected errors
+    SANITIZER = 115
 
 
 class SubmissionMode(Enum):
     """
     Different types of submission that can be made:
     Test: Run tests and give detailed results about passed/failed tests. These have short timeouts.
+    Sanitizer: Run tests under compute-sanitizer.
     Benchmark: Run larger benchmarks. Each benchmark is tested once, and then run multiple times.
     Profile: Gather profiling information. One selected benchmark is run under the profiler. No
         testing is performed in this mode (sometimes, you need to profile deliberately broken code)
@@ -92,6 +95,7 @@ class SubmissionMode(Enum):
     """
 
     TEST = "test"
+    SANITIZER = "sanitizer"
     BENCHMARK = "benchmark"
     PROFILE = "profile"
     LEADERBOARD = "leaderboard"
